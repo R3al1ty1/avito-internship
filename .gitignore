@@ -27,4 +27,66 @@ HELP.md
 /.nb-gradle/
 
 ### VS Code ###
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# Local History for Visual Studio Code
+.history/
+
+# Built Visual Studio Code Extensions
+*.vsix
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+.eggs/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Pycharm project files
+.idea/
+
+# PyTest cache
+.pytest_cache/
+
+# Coverage
+.coverage
+coverage.xml
+
+# Tox
+.tox/
+.cache/
+.python-version
+
+# VirtualEnv
+.venv/
+
+# Developers
+*.sw*
+manage.py
+.DS_Store
