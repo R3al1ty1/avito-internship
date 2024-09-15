@@ -7,6 +7,8 @@ from .serializers import TenderSerializer, BidSerializer, ReviewSerializer
 from rest_framework import status
 from backend.apps.models import Tender, TenderVersion, Bid, BidVersion, Employee, Organization, OrganizationResponsible, Review
 from django.db.models import Q
+from datetime import datetime
+import pytz
 
 
 @api_view(["GET"])
@@ -23,36 +25,29 @@ def ping(request):
 def get_tenders(request):
     """
     Получить список тендеров с возможностью фильтрации по типу услуг.
-    Если указан username, возвращаются все тендеры со статусом PUBLISHED
-    и те, за которые организация ответственна.
+    Параметры пагинации: limit (ограничение количества) и offset (смещение).
     """
-
-    username = request.GET.get('username')
     service_type = request.GET.get('service_type')
 
-    # Фильтрация по статусу
-    base_queryset = Tender.objects.filter(status="PUBLISHED")
+    try:
+        limit = int(request.GET.get('limit', 5))
+        offset = int(request.GET.get('offset', 0))
+    except ValueError:
+        return Response({'reason': 'Limit and offset must be integers'}, status=400)
 
-    if username:
-        try:
-            user = Employee.objects.get(username=username)
-
-            organization_ids = OrganizationResponsible.objects.filter(user=user).values_list('organization_id', flat=True)
-            
-            # Получить тендеры, связанные с организацией, и все тендеры со статусом PUBLISHED
-            tenders = base_queryset | Tender.objects.filter(organization_id__in=organization_ids)
-        except Employee.DoesNotExist:
-            return Response({'error': 'User not found'}, status=404)
-    else:
-        # Если username не указан, просто используем базовый запрос
-        tenders = base_queryset
+    # Базовый запрос: все тендеры со статусом "PUBLISHED"
+    tenders = Tender.objects.filter(status="PUBLISHED")
 
     # Фильтрация по типу услуг, если параметр указан
     if service_type:
         tenders = tenders.filter(service_type__icontains=service_type)
 
-    serializer = TenderSerializer(tenders.distinct(), many=True)
+    tenders = tenders.distinct()[offset:offset+limit]
+
+    serializer = TenderSerializer(tenders, many=True)
     return Response(serializer.data, status=200)
+
+
 
 
 @api_view(["POST"])
@@ -65,23 +60,37 @@ def create_tender(request):
     organization_id = request.data.get('organizationId')
     
     if not username or not organization_id:
-        return Response({"error": "Missing required fields: 'creatorUsername' and/or 'organizationId'."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Missing required fields: 'creatorUsername' and/or 'organizationId'."}, status=status.HTTP_400_BAD_REQUEST)
     
+    # Проверка существования пользователя
     try:
         creator = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "Creator with the specified username does not exist."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Creator with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
     
+    # Проверка существования организации
     try:
         organization = Organization.objects.get(id=organization_id)
     except Organization.DoesNotExist:
-        return Response({"error": "Organization with the specified ID does not exist."}, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Создание тендера
+        return Response({"reason": "Organization with the specified ID does not exist."}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Проверка, является ли пользователь ответственным за организацию
+    is_responsible = OrganizationResponsible.objects.filter(
+        organization=organization, 
+        user=creator
+    ).exists()
+
+    if not is_responsible:
+        return Response({"reason": "Creator is not responsible for the organization."}, status=status.HTTP_403_FORBIDDEN)
+
     data = request.data.copy()
     data['creator_username'] = username
     data['organization'] = organization_id
     data['status'] = 'CREATED'
+
+    timezone = pytz.timezone('Europe/Moscow')
+    current_time = datetime.now(timezone).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data['created_at'] = current_time
 
     serializer = TenderSerializer(data=data)
     if serializer.is_valid():
@@ -95,68 +104,95 @@ def create_tender(request):
 @permission_classes([AllowAny])
 def get_user_tenders(request):
     """
-    Получение списка тендеров для указанного пользователя по username.
+    Получение списка тендеров для указанного пользователя по username с поддержкой пагинации (limit и offset).
     """
     username = request.GET.get('username')
+    limit = request.GET.get('limit', 5)
+    offset = request.GET.get('offset', 0)
     
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
     
+    try:
+        user = Employee.objects.get(username=username)
+    except Employee.DoesNotExist:
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        limit = int(limit)
+        offset = int(offset)
+    except ValueError:
+        return Response({"reason": "Limit and offset must be integers."}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Получение всех тендеров пользователя
     tenders = Tender.objects.filter(creator_username=username)
+
+    tenders = tenders[offset:offset + limit]
+    
     serializer = TenderSerializer(tenders, many=True)
     
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-@api_view(["PATCH"])
-@permission_classes([AllowAny])
-def update_tender_status(request):
-    """
-    Обновить статус тендера, если пользователь ответственный за организацию тендера
-    """
 
-    new_status = request.data.get('status')
-    tender_id = request.data.get('tenderId')
+@api_view(["GET", "PUT"])
+@permission_classes([AllowAny])
+def tender_status(request, tender_id):
+    """
+    GET: Возвращает статус тендера.
+    PUT: Обновляет статус тендера, если пользователь ответственный за организацию.
+    """
     username = request.GET.get('username')
 
-    if not new_status:
-        return Response({"error": "Status is required."}, status=status.HTTP_400_BAD_REQUEST)
+    if not tender_id:
+        return Response({"reason": "Tender ID is required."}, status=status.HTTP_400_BAD_REQUEST)
     
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Проверка допустимых статусов
-    valid_statuses = ['PUBLISHED', 'CLOSED']
-    if new_status not in valid_statuses:
-        return Response({"error": "Invalid status. Valid statuses are: 'PUBLISHED', 'CLOSED'."}, status=status.HTTP_400_BAD_REQUEST)
-    
     try:
         tender = Tender.objects.get(id=tender_id)
     except Tender.DoesNotExist:
-        return Response({"error": "Tender with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "Tender with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
     
     try:
         user = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
-    
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
+
     # Проверка, является ли пользователь ответственным за организацию тендера
     responsible = OrganizationResponsible.objects.filter(
         organization=tender.organization,
         user=user
     ).exists()
+
+    # Обработка GET-запроса
+    if request.method == "GET":
+        return Response({"status": tender.status}, status=status.HTTP_200_OK)
     
-    if not responsible and user.username != tender.creator_username:
-        return Response({"error": "User is not authorized to update the status of this tender."}, status=status.HTTP_403_FORBIDDEN)
-    
-    tender.status = new_status
-    tender.save()
+    # Обработка PUT-запроса
+    if request.method == "PUT":
+        new_status = request.GET.get('status')  # Используем данные из тела запроса для PUT
+        if not new_status:
+            return Response({"reason": "Status is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-    serializer = TenderSerializer(tender)
-    return Response(serializer.data, status=status.HTTP_200_OK)
+        # Проверка допустимых статусов
+        valid_statuses = ['PUBLISHED', 'CLOSED']
+        if new_status not in valid_statuses:
+            return Response({"reason": f"Invalid status. Valid statuses are: {', '.join(valid_statuses)}."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not responsible and user.username != tender.creator_username:
+            return Response({"reason": "User is not authorized to update the status of this tender."}, status=status.HTTP_403_FORBIDDEN)
+        
+        # Обновляем статус
+        tender.status = new_status
+        tender.save()
+
+        serializer = TenderSerializer(tender)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-@api_view(["PUT"])
+@api_view(["PATCH"])
 @permission_classes([AllowAny])
 def edit_tender(request, tender_id):
     """
@@ -164,12 +200,12 @@ def edit_tender(request, tender_id):
     """
     username = request.GET.get('username')
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         user = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
     
     tender = get_object_or_404(Tender, id=tender_id)
     
@@ -179,7 +215,7 @@ def edit_tender(request, tender_id):
     ).exists()
 
     if not responsible:
-        return Response({"error": "User is not authorized to update the status of this tender."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "User is not authorized to update the status of this tender."}, status=status.HTTP_403_FORBIDDEN)
 
     serializer = TenderSerializer(tender, data=request.data, partial=True)
     if serializer.is_valid():
@@ -201,6 +237,7 @@ def edit_tender(request, tender_id):
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
 @api_view(["PUT"])
 @permission_classes([AllowAny])
 def rollback_tender_version(request, tender_id, version):
@@ -209,12 +246,12 @@ def rollback_tender_version(request, tender_id, version):
     """
     username = request.GET.get('username')
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         user = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
 
     tender = get_object_or_404(Tender, id=tender_id)
 
@@ -224,12 +261,12 @@ def rollback_tender_version(request, tender_id, version):
     ).exists()
 
     if not responsible:
-        return Response({"error": "User is not authorized to update the status of this tender."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "User is not authorized to update the status of this tender."}, status=status.HTTP_403_FORBIDDEN)
 
     try:
         tender_version = TenderVersion.objects.get(tender_id=tender_id, version=version)
     except TenderVersion.DoesNotExist:
-        return Response({"error": "Tender version with the specified version does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "Tender version with the specified version does not exist."}, status=status.HTTP_404_NOT_FOUND)
 
     tender.name = tender_version.name
     tender.description = tender_version.description
@@ -263,25 +300,25 @@ def create_bid(request):
     creator_username = request.data.get('creatorUsername')
 
     if not all([name, tender_id, organization_id, creator_username]):
-        return Response({"error": "Missing required fields: 'name', 'tenderId', 'organizationId', and/or 'creatorUsername'."}, status=status.HTTP_400_BAD_REQUEST)
-
-    # Проверка существования тендера
-    try:
-        tender = Tender.objects.get(id=tender_id)
-    except Tender.DoesNotExist:
-        return Response({"error": "Tender with the specified ID does not exist."}, status=status.HTTP_400_BAD_REQUEST)
-
-    # Проверка существования организации
-    try:
-        organization = Organization.objects.get(id=organization_id)
-    except Organization.DoesNotExist:
-        return Response({"error": "Organization with the specified ID does not exist."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Missing required fields: 'name', 'tenderId', 'organizationId', and/or 'creatorUsername'."}, status=status.HTTP_400_BAD_REQUEST)
 
     # Проверка существования создателя
     try:
         creator = Employee.objects.get(username=creator_username)
     except Employee.DoesNotExist:
-        return Response({"error": "Creator with the specified username does not exist."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Creator with the specified username does not exist."}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Проверка существования тендера
+    try:
+        tender = Tender.objects.get(id=tender_id)
+    except Tender.DoesNotExist:
+        return Response({"reason": "Tender with the specified ID does not exist."}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Проверка существования организации
+    try:
+        organization = Organization.objects.get(id=organization_id)
+    except Organization.DoesNotExist:
+        return Response({"reason": "Organization with the specified ID does not exist."}, status=status.HTTP_400_BAD_REQUEST)
 
     tender_organization = Organization.objects.get(id=tender.organization.id)
 
@@ -292,7 +329,7 @@ def create_bid(request):
     ).exists()
 
     if is_responsible:
-        return Response({"error": "Creator cannot make bids for the organization related to the tender."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "Creator cannot make bids for the organization related to the tender."}, status=status.HTTP_403_FORBIDDEN)
 
     # Создание нового предложения
     data = {
@@ -324,8 +361,13 @@ def get_user_bids(request):
     username = request.GET.get('username')
     
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
     
+    try:
+        user = Employee.objects.get(username=username)
+    except Employee.DoesNotExist:
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
+
     bids = Bid.objects.filter(creator_username=username)
     serializer = BidSerializer(bids, many=True)
     
@@ -336,82 +378,105 @@ def get_user_bids(request):
 @permission_classes([AllowAny])
 def get_bids_for_tender(request, tender_id):
     """
-    Получить список предложений для указанного тендера в зависимости от статуса и прав доступа.
+    Получить список предложений для указанного тендера в зависимости от статуса и прав доступа
+    с поддержкой пагинации через limit и offset.
     """
     tender = get_object_or_404(Tender, id=tender_id)
     
-    username = request.GET.get('username', None)
-    
+    username = request.GET.get('username')
+    limit = request.GET.get('limit', 5)
+    offset = request.GET.get('offset', 0)
+
+    try:
+        limit = int(limit)
+        offset = int(offset)
+    except ValueError:
+        return Response({"reason": "Limit and offset must be integers."}, status=status.HTTP_400_BAD_REQUEST)
+
     if username:
-        is_author = Bid.objects.filter(tender=tender, creator_username=username).exists()
-        
         try:
             user = Employee.objects.get(username=username)
-            user_organization = OrganizationResponsible.objects.filter(user=user).first()
         except Employee.DoesNotExist:
-            user_organization = None
-        
+            return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        is_author = Bid.objects.filter(tender=tender, creator_username=username).exists()
+        user_organization = OrganizationResponsible.objects.filter(user=user).first()
         is_responsible = user_organization and user_organization.organization == tender.organization
-        
+
         if is_author or is_responsible:
             bids = Bid.objects.filter(tender=tender)
         else:
             bids = Bid.objects.filter(tender=tender, status='PUBLISHED')
     else:
         bids = Bid.objects.filter(tender=tender, status='PUBLISHED')
+
+    paginated_bids = bids[offset:offset + limit]
+
+    serializer = BidSerializer(paginated_bids, many=True)
     
-    serializer = BidSerializer(bids, many=True)
     return Response(serializer.data, status=200)
 
 
-@api_view(["PATCH"])
-@permission_classes([AllowAny])
-def update_bid_status(request):
-    """
-    Обновить статус предложения. Статус может обновлять автор предложения или ответственный за организацию.
-    """
-    new_status = request.data.get('status')
-    bid_id = request.data.get('bidId')
-    username = request.GET.get('username')
 
-    if not new_status:
-        return Response({"error": "Status is required."}, status=status.HTTP_400_BAD_REQUEST)
+@api_view(["GET", "PUT"])
+@permission_classes([AllowAny])
+def bid_status(request, bid_id):
+    """
+    В зависимости от метода запроса:
+    - GET: Получить статус предложения.
+    - PUT: Обновить статус предложения. Статус может обновлять автор предложения или ответственный за организацию.
+    """
+    username = request.data.get('username') if request.method == "PUT" else request.GET.get('username')
     
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-    valid_statuses = ['PUBLISHED', 'CANCELED']
-    if new_status not in valid_statuses:
-        return Response({"error": "Invalid status. Valid statuses are: 'PUBLISHED', 'CANCELED'."}, status=status.HTTP_400_BAD_REQUEST)
-    
     try:
         bid = Bid.objects.get(id=bid_id)
     except Bid.DoesNotExist:
-        return Response({"error": "Bid with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
-    
+        return Response({"reason": "Bid with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
+
     try:
         user = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
-    
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
+
     responsible = OrganizationResponsible.objects.filter(
         organization=bid.organization,
         user=user
     ).exists()
-    
-    author = (user == bid.creator_username)
 
-    if not responsible and not author:
-        return Response({"error": "User is not authorized to update the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
-    
-    if bid.status != "CANCELED":
-        bid.status = new_status
-        bid.save()
-    else:
-        return Response({"error": "You can't edit a canceled bid."}, status=status.HTTP_403_FORBIDDEN)
-    
-    serializer = BidSerializer(bid)
-    return Response(serializer.data, status=status.HTTP_200_OK)
+    author = (user.username == bid.creator_username)
+
+    # GET-запрос: возвращаем текущий статус предложения
+    if request.method == "GET":
+        if responsible or author:
+            return Response({"status": bid.status}, status=status.HTTP_200_OK)
+        else:
+            return Response({"reason": "User is not authorized to view the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
+
+    # PUT-запрос: обновляем статус предложения
+    if request.method == "PUT":
+        new_status = request.data.get('status')
+
+        if not new_status:
+            return Response({"reason": "Status is required."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        valid_statuses = ['PUBLISHED', 'CANCELED']
+        if new_status not in valid_statuses:
+            return Response({"reason": "Invalid status. Valid statuses are: 'PUBLISHED', 'CANCELED'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not responsible and not author:
+            return Response({"reason": "User is not authorized to update the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
+
+        if bid.status != "CANCELED":
+            bid.status = new_status
+            bid.save()
+        else:
+            return Response({"reason": "You can't edit a canceled bid."}, status=status.HTTP_403_FORBIDDEN)
+        
+        serializer = BidSerializer(bid)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 @api_view(["PATCH"])
@@ -420,35 +485,35 @@ def submit_decision(request):
     """
     Отправка решения по предложению от ответственных за организацию, связанных с тендером.
     """
-    decision = request.data.get('decision')
-    bid_id = request.data.get('bidId')
+    decision = request.GET.get('decision')
+    bid_id = request.GET.get('bidId')
     username = request.GET.get('username')
 
     if not decision:
-        return Response({"error": "Decision is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Decision is required."}, status=status.HTTP_400_BAD_REQUEST)
     
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
     # Проверка допустимых статусов
     valid_statuses = ['Accept', 'Decline']
     if decision not in valid_statuses:
-        return Response({"error": "Invalid status. Valid statuses are: 'Accept', 'Decline'."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Invalid status. Valid statuses are: 'Accept', 'Decline'."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         bid = Bid.objects.get(id=bid_id)
     except Bid.DoesNotExist:
-        return Response({"error": "Bid with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "Bid with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
     
     try:
         user = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
     
     try:
         tender = Tender.objects.get(id=bid.tender_id)
     except Tender.DoesNotExist:
-        return Response({"error": "Tender with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "Tender with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
 
     responsible = OrganizationResponsible.objects.filter(
         organization=tender.organization,
@@ -458,11 +523,11 @@ def submit_decision(request):
     author = (user == bid.creator_username)
 
     if not responsible and not author:
-        return Response({"error": "User is not authorized to update the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "User is not authorized to update the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
     
     # Проверка, голосовал ли пользователь ранее
     if bid.voters.filter(id=user.id).exists():
-        return Response({"error": "User has already voted on this bid."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "User has already voted on this bid."}, status=status.HTTP_403_FORBIDDEN)
 
     # Обновление статуса предложения
     if decision == "Accept":
@@ -482,7 +547,7 @@ def submit_decision(request):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-@api_view(["PUT"])
+@api_view(["PATCH"])
 @permission_classes([AllowAny])
 def edit_bid(request, bid_id):
     """
@@ -491,12 +556,12 @@ def edit_bid(request, bid_id):
     username = request.GET.get('username')
     bid = get_object_or_404(Bid, id=bid_id)
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         user = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
     
     responsible = OrganizationResponsible.objects.filter(
         organization=bid.organization,
@@ -506,7 +571,7 @@ def edit_bid(request, bid_id):
     author = (user == bid.creator_username)
 
     if not responsible and not author:
-        return Response({"error": "User is not authorized to update the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "User is not authorized to update the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
 
     serializer = BidSerializer(bid, data=request.data, partial=True)
 
@@ -542,17 +607,17 @@ def rollback_bid_version(request, bid_id, version):
     username = request.GET.get('username')
 
     if not username:
-        return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         user = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
     
     try:
         bid = Bid.objects.get(id=bid_id)
     except Bid.DoesNotExist:
-        return Response({"error": "Bid with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "Bid with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
 
     responsible = OrganizationResponsible.objects.filter(
         organization=bid.organization,
@@ -562,12 +627,12 @@ def rollback_bid_version(request, bid_id, version):
     author = (user == bid.creator_username)
 
     if not responsible and not author:
-        return Response({"error": "User is not authorized to update or rollback the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "User is not authorized to update or rollback the status of this bid."}, status=status.HTTP_403_FORBIDDEN)
     
     try:
         bid_version = BidVersion.objects.get(bid_id=bid_id, version=version)
     except BidVersion.DoesNotExist:
-        return Response({"error": "Bid version with the specified version does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "Bid version with the specified version does not exist."}, status=status.HTTP_404_NOT_FOUND)
     
     # Обновление текущего предложения данными из указанной версии
     bid.name = bid_version.name
@@ -589,22 +654,22 @@ def rollback_bid_version(request, bid_id, version):
     return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-@api_view(["POST"])
+@api_view(["PUT"])
 @permission_classes([AllowAny])
 def create_review(request, bid_id):
     """
     Оставление отзыва на предложение
     """
     username = request.GET.get('username')
-    content = request.data.get('content')
+    content = request.GET.get('bidFeedback')
 
     if not username or not content:
-        return Response({"error": "Username and content are required."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"reason": "Username and content are required."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         user = Employee.objects.get(username=username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
 
     bid = get_object_or_404(Bid, id=bid_id)
     
@@ -614,7 +679,7 @@ def create_review(request, bid_id):
     ).exists()
 
     if not responsible:
-        return Response({"error": "User is not authorized to leave a review for this bid."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "User is not authorized to leave a review for this bid."}, status=status.HTTP_403_FORBIDDEN)
 
     review = Review.objects.create(
         bid=bid,
@@ -630,23 +695,31 @@ def create_review(request, bid_id):
 @permission_classes([AllowAny])
 def get_reviews(request, tender_id):
     """
-    Просмотр отзывов на предложения автора, который создал предложение для его тендера.
+    Просмотр отзывов на предложения автора.
     """
-    author_username = request.GET.get('username')
+    author_username = request.GET.get('authorUsername')
+    request_username = request.GET.get('requestUsername')
 
+    limit = int(request.GET.get('limit', 5))
+    offset = int(request.GET.get('offset', 0))
 
-    if not author_username:
-        return Response({"error": "username are required."}, status=status.HTTP_400_BAD_REQUEST)
+    if not author_username or not request_username:
+        return Response({"reason": "username are required."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
         author = Employee.objects.get(username=author_username)
     except Employee.DoesNotExist:
-        return Response({"error": "User with the specified username does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "Author with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
+
+    try:
+        user = Employee.objects.get(username=request_username)
+    except Employee.DoesNotExist:
+        return Response({"reason": "Request User with the specified username does not exist."}, status=status.HTTP_401_UNAUTHORIZED)
 
     try:
         tender = Tender.objects.get(id=tender_id)
     except Tender.DoesNotExist:
-        return Response({"error": "Tender with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"reason": "Tender with the specified ID does not exist."}, status=status.HTTP_404_NOT_FOUND)
 
     bids = Bid.objects.filter(
         tender_id=tender_id,
@@ -655,12 +728,13 @@ def get_reviews(request, tender_id):
 
     responsible = OrganizationResponsible.objects.filter(
         organization=tender.organization,
-        user=author
+        user=user
     ).exists()
 
     if not responsible:
-        return Response({"error": "User is not authorized to view reviews for this tender."}, status=status.HTTP_403_FORBIDDEN)
+        return Response({"reason": "User is not authorized to view reviews for this tender."}, status=status.HTTP_403_FORBIDDEN)
 
-    reviews = Review.objects.filter(bid__in=bids)
+    reviews = Review.objects.filter(bid__in=bids)[offset:offset + limit]
     serializer = ReviewSerializer(reviews, many=True)
+
     return Response(serializer.data, status=status.HTTP_200_OK)
